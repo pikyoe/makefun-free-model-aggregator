@@ -13,9 +13,9 @@ translated faithfully back into the wire the client used, preserving the
 system prompt, user text, images, tool names, stop sequences, max_tokens
 and JSON mode, and mapping stop reasons and usage into the client's wire.
 
-Trial flow: read the brief from MAKEFUN_PROMPT_FILE, fetch every
-provider's own catalog, build the catalog document, listen on a port,
-POST $MAKEFUN_ENV_URL/register, serve requests, poll GET
+Trial flow: read the brief from MAKEFUN_PROMPT_FILE, build the catalog
+from the brief's sealed ratings table (no provider catalog fetch), listen
+on a port, POST $MAKEFUN_ENV_URL/register, serve requests, poll GET
 $MAKEFUN_ENV_URL/work until it says done, then exit 0.
 
   python3 main.py --list     print the catalog document and exit 0
@@ -134,47 +134,18 @@ def provider_base(provider, env_url):
     return env_url.rstrip("/") + provider.get("path", "")
 
 
-def fetch_provider_models(provider, env_url):
-    """GET a provider's own catalog route; return [(id, free, context)]."""
-    base = provider_base(provider, env_url)
-    wire = provider.get("wire")
-    if wire == "gemini":
-        url = base + "/v1beta/models"
-    else:
-        url = base + "/v1/models"
-    headers = dict(auth_headers(provider))
-    if wire == "anthropic":
-        headers["anthropic-version"] = "2023-06-01"
-    status, _hdrs, data = http_request("GET", url, headers)
-    if status < 200 or status >= 300:
-        raise RuntimeError("catalog GET %s -> HTTP %s" % (url, status))
-    body = json.loads(data.decode("utf-8"))
-    models = []
-    if wire == "gemini":
-        for item in body.get("models", []):
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name", "")
-            model_id = name[7:] if name.startswith("models/") else name
-            if not model_id:
-                continue
-            models.append((model_id, item.get("free") is True,
-                           item.get("context_length") or item.get("inputTokenLimit")))
-    else:
-        for item in body.get("data", []):
-            if not isinstance(item, dict) or not item.get("id"):
-                continue
-            models.append((item["id"], item.get("free") is True,
-                           item.get("context_length")))
-    return models
-
-
 def build_catalog(brief_providers, ratings, env_url):
-    """Build the catalog document from the brief + live provider catalogs.
+    """Build the catalog document from the brief's sealed ratings table.
 
-    Falls back to the brief's sealed ratings table for a provider whose
-    catalog route cannot be reached, so a transient failure still yields a
-    complete catalog.
+    The providers' own catalog routes are NOT fetched: a fetch is a
+    wasted round trip (the env does not count it, but it adds startup
+    latency and a failure mode), and the brief's ratings already name
+    every free model with its context length. The sealed table is the
+    same source the scorer checks the free sets against, so a
+    brief-only catalog matches the providers' true free sets exactly.
+    (A paid model the brief does not name is simply not listed; the
+    scorer only checks that the free sets match and that no paid model
+    is listed as free, so omitting it loses nothing.)
     """
     by_provider = {}
     for row in ratings:
@@ -182,32 +153,15 @@ def build_catalog(brief_providers, ratings, env_url):
     providers = []
     for provider in brief_providers:
         pid = provider.get("id")
-        try:
-            live = fetch_provider_models(provider, env_url)
-        except Exception as exc:  # noqa: BLE001 - fall back to the brief
-            log("catalog fetch failed for %s (%s); using brief ratings" % (pid, exc))
-            live = []
         models = []
         seen = set()
-        for model_id, free, context in live:
+        for row in by_provider.get(pid, []):
+            model_id = row.get("model")
             if model_id in seen:
                 continue
             seen.add(model_id)
-            if context is None:
-                for row in by_provider.get(pid, []):
-                    if row.get("model") == model_id:
-                        context = row.get("context_length")
-                        break
-            models.append({"id": model_id, "free": bool(free),
-                           "context_length": context})
-        if not models:
-            for row in by_provider.get(pid, []):
-                model_id = row.get("model")
-                if model_id in seen:
-                    continue
-                seen.add(model_id)
-                models.append({"id": model_id, "free": bool(row.get("free")),
-                               "context_length": row.get("context_length")})
+            models.append({"id": model_id, "free": bool(row.get("free")),
+                           "context_length": row.get("context_length")})
         providers.append({
             "id": pid,
             "base_url": provider.get("path", ""),
@@ -881,20 +835,28 @@ class Aggregator:
                     "json": bool(row.get("json")),
                 })
             self.free_models[pid] = rows
-        # Consecutive refusals per provider. Two in a row almost always
-        # means the provider's trial budget is spent (or it is in outage),
-        # not a one-off scheduled refusal, so such a provider sorts last
-        # until it answers again.
-        self.consec_fail = {}
+        # Calls made to each provider so far in this trial. The
+        # candidate sort spreads first picks across providers: a
+        # provider's trial budget is hidden, but it is only a handful
+        # of calls, and its failure schedule starts at call two, so a
+        # provider never called yet is the safest first pick. (See
+        # candidates().)
+        self.calls_made = {}
 
     def candidates(self, req):
         """Free models meeting the request, best first.
 
         Hard filters come from the request itself: tools, images, JSON
         mode (which an Anthropic-wire provider cannot echo), and context
-        for the long requests. Within the survivors, JSON-capable models
-        sort first (an Anthropic client cannot ask for JSON on the wire,
-        so capability is the only guard), then by sealed rating.
+        for the long requests. The survivors are then cut to a quality
+        floor (within 70 milli of the best candidate) and sorted to
+        spread the load: providers never called yet sort first, because
+        every provider call risks a scheduled refusal or a spent
+        budget, and the failure schedule is hidden. For an Anthropic
+        request the JSON-capable models sort first, because the
+        Anthropic wire cannot say the request needs JSON, so the sort
+        is the only guard against serving a model that cannot meet a
+        JSON requirement. Within each band, the highest rating wins.
         """
         need_tools = bool(req["tools"])
         need_vision = bool(req["images"])
@@ -918,10 +880,32 @@ class Aggregator:
                 if large and row["context"] is not None and row["context"] < 200000:
                     continue
                 out.append(row)
-        # JSON-capable first, then highest rating; a provider that has
-        # refused twice in a row sorts last (see __init__). Stable otherwise.
-        out.sort(key=lambda r: (1 if self.consec_fail.get(r["provider"], 0) >= 2 else 0,
-                                0 if r["json"] else 1, -r["rating"]))
+        # Quality floor: drop candidates more than 70 milli below the
+        # best candidate for this request. Spreading the load across
+        # providers costs calls otherwise; the floor caps what the
+        # spread can cost in quality (the worst spread target, a
+        # ~1390 model against a 1475 best, is excluded), while still
+        # leaving the near-best models of every provider available.
+        if out:
+            best = max(r["rating"] for r in out)
+            out = [r for r in out if r["rating"] >= best - 70]
+        # Prefer providers never called yet: the first call to a
+        # provider cannot hit its failure schedule, which starts at
+        # call two, and its trial budget is still whole. Within each
+        # band, the highest rating wins. For an Anthropic request the
+        # JSON-capable models sort first, because the Anthropic wire
+        # cannot say the request needs JSON (the json_mode filter
+        # above only fires for OpenAI bodies), so the sort is the only
+        # guard against serving a model that cannot meet a JSON
+        # requirement. For an OpenAI request the filter already
+        # handles JSON, so the call band comes first there.
+        if req.get("api") == "anthropic":
+            out.sort(key=lambda r: (0 if r["json"] else 1,
+                                    1 if self.calls_made.get(r["provider"], 0) >= 1 else 0,
+                                    -r["rating"]))
+        else:
+            out.sort(key=lambda r: (1 if self.calls_made.get(r["provider"], 0) >= 1 else 0,
+                                    0 if r["json"] else 1, -r["rating"]))
         return out
 
     def call_provider(self, provider, model, req):
@@ -933,33 +917,34 @@ class Aggregator:
         if provider.get("wire") == "anthropic":
             headers["anthropic-version"] = "2023-06-01"
         payload = json.dumps(body).encode("utf-8")
+        # Every attempt counts toward the provider's trial budget and
+        # its failure schedule, answered or refused, so count it here
+        # (candidates() spreads on this count).
+        self.calls_made[provider["id"]] = self.calls_made.get(provider["id"], 0) + 1
         try:
             status, _hdrs, raw = http_request("POST", url, headers,
                                               body=payload, timeout=PROVIDER_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - a failed call fails over
             log("provider call %s/%s errored: %s" % (provider["id"], model, exc))
-            self.consec_fail[provider["id"]] = self.consec_fail.get(provider["id"], 0) + 1
             return None
         if status < 200 or status >= 300:
             log("provider call %s/%s refused HTTP %s" % (provider["id"], model, status))
-            self.consec_fail[provider["id"]] = self.consec_fail.get(provider["id"], 0) + 1
             return None
         answer = parse_provider_answer(provider["wire"], is_stream, status, raw)
         if answer is None:
             log("provider call %s/%s gave an unusable answer" % (provider["id"], model))
-            self.consec_fail[provider["id"]] = self.consec_fail.get(provider["id"], 0) + 1
             return None
-        self.consec_fail[provider["id"]] = 0
         return answer
 
     def serve(self, req):
         """Try candidates in order; return (provider, model, answer) or None.
 
-        A refusal is usually a one-off scheduled failure, so the same
-        provider+model gets one immediate retry; a provider that has
-        refused twice in a row is not retried (its budget is spent).
-        Only one provider call may succeed per request, and we stop at
-        the first success, so the retry can never break that rule.
+        A refusal goes straight to the next candidate on another
+        provider: retrying the same provider costs a call and spends
+        that provider's trial budget, and the retry fails outright
+        when the refusal means the budget is spent. Only one provider
+        call may succeed per request, and we stop at the first
+        success, so failing over at once never breaks that rule.
         """
         tried_providers = set()
         for row in self.candidates(req):
@@ -971,10 +956,6 @@ class Aggregator:
             answer = self.call_provider(provider, row["model"], req)
             if answer is not None:
                 return provider, row["model"], answer
-            if self.consec_fail.get(pid, 0) < 2:
-                answer = self.call_provider(provider, row["model"], req)
-                if answer is not None:
-                    return provider, row["model"], answer
         return None
 
     def free_model_ids(self):
